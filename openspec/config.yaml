@@ -1,0 +1,76 @@
+schema: spec-driven
+
+context: |
+  Project: pi-azure-foundry — a pi extension that connects Azure AI Foundry
+    to the pi coding agent
+  Package: @nquandt/pi-azure-foundry (npm, MIT, public)
+  Tech stack: TypeScript 5, ES modules, Node.js ≥18, compiled with tsc
+  Build tools: npm (build: tsc, type-check: tsc --noEmit, dev: tsc --watch)
+  No test runner configured; type correctness (tsc --noEmit) is the primary
+    quality gate
+  Single source file: src/index.ts (mirrored to
+    .pi/extensions/azure-foundry/index.ts)
+  Peer dependencies: @earendil-works/pi-ai, @earendil-works/pi-coding-agent
+  Bundled dependency: @azure/identity (DefaultAzureCredential, AccessToken)
+
+  Domain responsibilities:
+    - Config: loads azure-foundry.config.json from cwd or ~/.pi/;
+      validates resourceId, projectId, auth
+    - Auth: api-key (static) or azure-identity (DefaultAzureCredential +
+      Entra ID token cache with 5-min expiry buffer)
+    - Deployment Discovery: calls Azure Foundry deployments API, filters to
+      chat_completion-capable, resolves model defaults and API route per
+      deployment
+    - Streaming: two protocol paths — Anthropic Messages API (native SSE) and
+      OpenAI-compatible chat completions (SSE); includes message format
+      conversion
+      (toAnthropicMessages, toOpenAIMessages) and usage accounting
+    - Extension Entry Point: wires config + auth + discovery + registration
+      via pi.registerProvider
+
+  Routing logic:
+    - Anthropic publisher → /anthropic/v1/messages with
+      Authorization: Bearer <token>
+    - All others → /openai/deployments/{id}/chat/completions
+      ?api-version=2024-10-21
+    - GPT-5/o-series models use max_completion_tokens instead of max_tokens
+      (inferred by name or MODEL_DEFAULTS)
+
+  Auth header conventions:
+    - OpenAI route, api-key auth → "api-key: <key>" header
+    - OpenAI route, azure-identity → "Authorization: Bearer <entra-token>"
+    - Anthropic route (both auth types) → "Authorization: Bearer <token>"
+
+  Model defaults: pre-configured in MODEL_DEFAULTS for known models; unknown
+    deployments fall back to 128K context / 4K output / text-only / max_tokens
+  Config search order: <cwd>/azure-foundry.config.json
+    → ~/.pi/azure-foundry.config.json
+
+  Commit style: Conventional Commits — <type>(<scope>): <subject>
+    (scopes used occasionally)
+  Common commit types: feat, fix, chore, docs
+
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a "Non-goals" section
+    - Identify which domain(s) are affected
+      (config / auth / deployment-discovery / streaming / extension)
+    - Note if a change affects both the Anthropic path and the OpenAI-compat
+      path, or only one
+    - Flag any auth header changes — api-key and azure-identity behave
+      differently per route
+  design:
+    - Reference specific functions by name
+      (e.g., streamAnthropic, toOpenAIMessages, inferOpenAITokenLimit)
+    - Note any changes to MODEL_DEFAULTS or apiRouteMap
+    - Call out changes to the token caching strategy (cachedToken, expiryBuffer)
+    - Consider config search-order implications for any new config fields
+  tasks:
+    - Break tasks into chunks completable in under 2 hours
+    - Include npm run type-check as a verification step in every
+      implementation task
+    - Note if a task requires updating MODEL_DEFAULTS, apiRouteMap,
+      or providerAuthMap
+    - Reference specific file paths
+      (src/index.ts or .pi/extensions/azure-foundry/index.ts)
