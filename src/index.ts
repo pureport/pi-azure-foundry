@@ -144,7 +144,12 @@ interface ResolvedModelDetails {
   source: "config" | "catalog" | "fallback";
 }
 
-const ZERO_COST: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const ZERO_COST: ModelCost = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+};
 
 const FALLBACK: ResolvedModelDetails = {
   contextWindow: 128000,
@@ -203,7 +208,8 @@ function resolveModelDetails(
   // Start with catalog metadata, or the conservative fallback if unknown.
   const base: ResolvedModelDetails = catalogModel
     ? (() => {
-        const compatMaxTokensField = (catalogModel as any).compat?.maxTokensField;
+        const compatMaxTokensField = (catalogModel as any).compat
+          ?.maxTokensField;
         return {
           contextWindow: catalogModel.contextWindow,
           maxTokens: catalogModel.maxTokens,
@@ -212,7 +218,8 @@ function resolveModelDetails(
           cost: catalogModel.cost,
           thinkingLevelMap: catalogModel.thinkingLevelMap,
           openaiTokenLimit:
-            compatMaxTokensField === "max_tokens" || compatMaxTokensField === "max_completion_tokens"
+            compatMaxTokensField === "max_tokens" ||
+            compatMaxTokensField === "max_completion_tokens"
               ? compatMaxTokensField
               : undefined,
           source: "catalog",
@@ -228,7 +235,7 @@ function resolveModelDetails(
     ...override,
     cost: {
       ...base.cost,
-      ...override.cost // spreading undefined in JS is fine
+      ...override.cost, // spreading undefined in JS is fine
     },
     source: "config",
   };
@@ -313,7 +320,10 @@ function loadUserModels(): import("@earendil-works/pi-coding-agent").ProviderMod
 }
 
 /** Infer OpenAI-compat token limit from resolved metadata or model name patterns. */
-function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails): OpenAITokenLimitParam {
+function inferOpenAITokenLimit(
+  modelName: string,
+  resolved: ResolvedModelDetails,
+): OpenAITokenLimitParam {
   if (resolved.openaiTokenLimit) return resolved.openaiTokenLimit;
   // GPT-5 and o-series models reject max_tokens on Azure/OpenAI chat completions
   if (/^(gpt-5|o[1-9])([-.]|$)/i.test(modelName))
@@ -321,10 +331,16 @@ function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails
   return "max_tokens";
 }
 
-function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
+function resolveApiRoute(
+  d: Deployment,
+  resolved: ResolvedModelDetails,
+): ApiRoute {
   if (d.modelPublisher === "Anthropic") return { kind: "anthropic-messages" };
   const modelName = d.modelName ?? d.name;
-  return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName, resolved) };
+  return {
+    kind: "openai-chat-completions",
+    tokenLimit: inferOpenAITokenLimit(modelName, resolved),
+  };
 }
 
 function describeApiRoute(route: ApiRoute): string {
@@ -360,9 +376,13 @@ function deploymentToModel(
   };
 
   if (details.source === "fallback") {
-    console.log(`[Azure Foundry] ${d.name}: no metadata for "${modelName}" — using fallback defaults`);
+    console.log(
+      `[Azure Foundry] ${d.name}: no metadata for "${modelName}" — using fallback defaults`,
+    );
   } else if (details.source === "config") {
-    console.log(`[Azure Foundry] ${d.name}: using config override for "${modelName}"`);
+    console.log(
+      `[Azure Foundry] ${d.name}: using config override for "${modelName}"`,
+    );
   }
 
   return model;
@@ -1033,7 +1053,9 @@ export default async function (pi: ExtensionAPI) {
     (d) => d.capabilities?.chat_completion === "true",
   );
   const catalog = buildKnownModelCatalog();
-  const models = deployments.map((d) => deploymentToModel(d, catalog, config.models));
+  const models = deployments.map((d) =>
+    deploymentToModel(d, catalog, config.models),
+  );
   const userModels = loadUserModels();
   const allModels = [...models, ...userModels];
 
@@ -1049,7 +1071,6 @@ export default async function (pi: ExtensionAPI) {
   console.log(
     `[Azure Foundry] Found ${deployments.length} deployment(s): ${summary}`,
   );
-
 
   const providerId = "azure-foundry";
   // Store the auth context so streamAzureFoundry can build the right headers per-request.

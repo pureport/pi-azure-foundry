@@ -173,6 +173,50 @@ Common use-cases include fixing stale data in the `pi-ai` catalog, setting custo
 
 ---
 
+### User-defined models
+
+For models not returned by the deployment discovery API — such as privately hosted endpoints or Azure AI deployments in a different project — you can register them directly in `~/.pi/agent/models.json` under `providers["azure-foundry"].models`. These are loaded at startup alongside discovered deployments.
+
+```json
+{
+  "providers": {
+    "azure-foundry": {
+      "models": [
+        {
+          "id": "my-llama",
+          "name": "Llama 3.3 70B",
+          "api": "openai-chat-completions",
+          "baseUrl": "https://my-other-resource.services.ai.azure.com/api/projects/my-other-project",
+          "deploymentId": "Llama-3.3-70B-Instruct",
+          "contextWindow": 131072,
+          "maxTokens": 8192,
+          "reasoning": false,
+          "input": ["text"]
+        }
+      ]
+    }
+  }
+}
+```
+
+Required fields per entry:
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `id` | string | Stable pi model id (shown in the model picker) |
+| `name` | string | Human-readable display name |
+| `api` | `"openai-chat-completions"` \| `"anthropic-messages"` | API route to use |
+| `baseUrl` | string | Azure Foundry project base URL (same format as the auto-discovered endpoint) |
+| `deploymentId` | string | Azure deployment name (may differ from `id`) |
+| `contextWindow` | number | Model context window in tokens |
+| `maxTokens` | number | Maximum output tokens per request |
+
+Optional fields: `reasoning` (boolean, default `false`), `input` (array, default `["text"]`), `thinkingLevelMap`, `compat`.
+
+User-defined models use the same auth configuration as discovered deployments. The startup log shows a breakdown when both are present: `✓ Registered 2 deployment(s) + 1 user-defined model(s)`.
+
+---
+
 ## Development
 
 ```bash
