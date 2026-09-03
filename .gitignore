@@ -21,3 +21,6 @@ coverage/
 
 openspec/changes/*
 !openspec/changes/archive
+
+.pi/*
+bun.lock
