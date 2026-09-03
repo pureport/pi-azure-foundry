@@ -22,9 +22,21 @@ import {
   type ImageContent,
   type ThinkingContent,
   type ToolResultMessage,
+  type ModelCost,
   calculateCost,
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
+import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
+import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
+import { MISTRAL_MODELS } from "@earendil-works/pi-ai/providers/mistral.models";
+import { FIREWORKS_MODELS } from "@earendil-works/pi-ai/providers/fireworks.models";
+import { HUGGINGFACE_MODELS } from "@earendil-works/pi-ai/providers/huggingface.models";
+import { ZAI_MODELS } from "@earendil-works/pi-ai/providers/zai.models";
+import { MINIMAX_MODELS } from "@earendil-works/pi-ai/providers/minimax.models";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
+import { XAI_MODELS } from "@earendil-works/pi-ai/providers/xai.models";
+import { MOONSHOTAI_MODELS } from "@earendil-works/pi-ai/providers/moonshotai.models";
+import { MOONSHOTAI_CN_MODELS } from "@earendil-works/pi-ai/providers/moonshotai-cn.models";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
@@ -38,10 +50,22 @@ type AuthConfig =
   | { type: "api-key"; apiKey: string }
   | { type: "azure-identity" };
 
+type OpenAITokenLimitParam = "max_tokens" | "max_completion_tokens";
+
+interface ModelConfigOverride {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  input?: ("text" | "image")[];
+  cost?: ModelCost;
+  openaiTokenLimit?: OpenAITokenLimitParam;
+}
+
 interface Config {
   resourceId: string;
   projectId: string;
   auth: AuthConfig;
+  models?: Record<string, ModelConfigOverride>;
 }
 
 // =============================================================================
@@ -62,7 +86,8 @@ async function getIdentityToken(): Promise<string> {
   }
   const credential = new DefaultAzureCredential();
   cachedToken = await credential.getToken(AZURE_AI_SCOPE);
-  if (!cachedToken) throw new Error("[Azure Foundry] Failed to acquire identity token");
+  if (!cachedToken)
+    throw new Error("[Azure Foundry] Failed to acquire identity token");
   return cachedToken.token;
 }
 
@@ -99,8 +124,8 @@ function loadConfig(): Config {
   }
   throw new Error(
     `azure-foundry.config.json not found. Checked:\n` +
-    candidates.map((p) => `  ${p}`).join("\n") +
-    `\n\nCreate one in your project root or at ~/.pi/azure-foundry.config.json`
+      candidates.map((p) => `  ${p}`).join("\n") +
+      `\n\nCreate one in your project root or at ~/.pi/azure-foundry.config.json`,
   );
 }
 
@@ -108,29 +133,106 @@ function loadConfig(): Config {
 // Deployment → Model mapping
 // =============================================================================
 
-type OpenAITokenLimitParam = "max_tokens" | "max_completion_tokens";
-
-interface ModelDefaults {
+interface ResolvedModelDetails {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
   input: ("text" | "image")[];
-  /** OpenAI-compat token limit field; newer GPT-5/o-series models require max_completion_tokens */
+  cost: ModelCost;
+  thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
   openaiTokenLimit?: OpenAITokenLimitParam;
+  source: "config" | "catalog" | "fallback";
 }
 
-const MODEL_DEFAULTS: Record<string, ModelDefaults> = {
-  "claude-sonnet-4-5":  { contextWindow: 200000, maxTokens: 16384, reasoning: true,  input: ["text", "image"] },
-  "claude-sonnet-4-6":  { contextWindow: 200000, maxTokens: 16384, reasoning: true,  input: ["text", "image"] },
-  "claude-haiku-4-5":   { contextWindow: 200000, maxTokens: 16384, reasoning: false, input: ["text", "image"] },
-  "claude-opus-4-5":    { contextWindow: 200000, maxTokens: 32000, reasoning: true,  input: ["text", "image"] },
-  "gpt-5.4-nano":       { contextWindow: 128000, maxTokens: 16384, reasoning: false, input: ["text", "image"], openaiTokenLimit: "max_completion_tokens" },
-  "gpt-4o":             { contextWindow: 128000, maxTokens: 4096,  reasoning: false, input: ["text", "image"] },
-  "gpt-4o-mini":        { contextWindow: 128000, maxTokens: 4096,  reasoning: false, input: ["text", "image"] },
-  "Kimi-K2.5":          { contextWindow: 131072, maxTokens: 8192,  reasoning: false, input: ["text"] },
-  "Kimi-K2.6":          { contextWindow: 131072, maxTokens: 8192,  reasoning: false, input: ["text"] },
+const ZERO_COST: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+const FALLBACK: ResolvedModelDetails = {
+  contextWindow: 128000,
+  maxTokens: 4096,
+  reasoning: false,
+  input: ["text"],
+  cost: ZERO_COST,
+  source: "fallback",
 };
-const FALLBACK: ModelDefaults = { contextWindow: 128000, maxTokens: 4096, reasoning: false, input: ["text"] };
+
+/** Lower-case a model/catalog name so Azure and pi-ai ids can be matched. */
+function normalizeModelName(name: string): string {
+  return name.toLowerCase();
+}
+
+/** Build a map from normalized model id to pi-ai's built-in model metadata. */
+function buildKnownModelCatalog(): Map<string, Model<Api>> {
+  const catalog = new Map<string, Model<Api>>();
+  const providerCatalogs = [
+    ANTHROPIC_MODELS,
+    OPENAI_MODELS,
+    MISTRAL_MODELS,
+    FIREWORKS_MODELS,
+    HUGGINGFACE_MODELS,
+    ZAI_MODELS,
+    MINIMAX_MODELS,
+    DEEPSEEK_MODELS,
+    XAI_MODELS,
+    MOONSHOTAI_MODELS,
+    MOONSHOTAI_CN_MODELS,
+  ];
+  for (const models of providerCatalogs) {
+    for (const model of Object.values(models) as Model<Api>[]) {
+      const key = normalizeModelName(model.id);
+      if (catalog.has(key)) continue;
+      catalog.set(key, model);
+    }
+  }
+  return catalog;
+}
+
+/**
+ * Resolve model details in precedence order:
+ *   1. User override in azure-foundry.config.json (exact Azure modelName)
+ *   2. pi-ai built-in model catalog (normalized id match)
+ *   3. Conservative fallback defaults
+ */
+function resolveModelDetails(
+  modelName: string,
+  catalog: Map<string, Model<Api>>,
+  overrides: Record<string, ModelConfigOverride> | undefined,
+): ResolvedModelDetails {
+  const override = overrides?.[modelName];
+  const catalogModel = catalog.get(normalizeModelName(modelName));
+
+  // Start with catalog metadata, or the conservative fallback if unknown.
+  const base: ResolvedModelDetails = catalogModel
+    ? (() => {
+        const compatMaxTokensField = (catalogModel as any).compat?.maxTokensField;
+        return {
+          contextWindow: catalogModel.contextWindow,
+          maxTokens: catalogModel.maxTokens,
+          reasoning: catalogModel.reasoning,
+          input: catalogModel.input,
+          cost: catalogModel.cost,
+          thinkingLevelMap: catalogModel.thinkingLevelMap,
+          openaiTokenLimit:
+            compatMaxTokensField === "max_tokens" || compatMaxTokensField === "max_completion_tokens"
+              ? compatMaxTokensField
+              : undefined,
+          source: "catalog",
+        };
+      })()
+    : FALLBACK;
+
+  if (!override) return base;
+
+  // Apply only the override keys that are present.
+  return {
+    ...base,
+    ...override,
+    cost: {
+      ...base.cost,
+      ...override.cost // spreading undefined in JS is fine
+    },
+    source: "config",
+  };
+}
 
 /** Per-deployment API route resolved at discovery time */
 type ApiRoute =
@@ -138,19 +240,91 @@ type ApiRoute =
   | { kind: "openai-chat-completions"; tokenLimit: OpenAITokenLimitParam };
 
 const apiRouteMap = new Map<string, ApiRoute>();
+const deploymentIdMap = new Map<string, string>(); // model.id → deploymentId (user-defined models only)
 
-/** Infer OpenAI-compat token limit from model name when not explicitly configured */
-function inferOpenAITokenLimit(modelName: string): OpenAITokenLimitParam {
-  if (MODEL_DEFAULTS[modelName]?.openaiTokenLimit) return MODEL_DEFAULTS[modelName].openaiTokenLimit!;
+/** Resolve the Azure deployment name for a model — user-defined models may differ from model.id */
+function resolveDeploymentId(model: Model<Api>): string {
+  return deploymentIdMap.get(model.id) ?? model.id;
+}
+
+/** Infer the API route for a user-defined model from its api field */
+function inferUserModelRoute(api: string): ApiRoute {
+  if (api === "anthropic-messages") return { kind: "anthropic-messages" };
+  return { kind: "openai-chat-completions", tokenLimit: "max_tokens" };
+}
+
+/** Load user-defined model entries from ~/.pi/agent/models.json */
+function loadUserModels(): import("@earendil-works/pi-coding-agent").ProviderModelConfig[] {
+  const modelsJsonPath = resolve(homedir(), ".pi", "agent", "models.json");
+  if (!existsSync(modelsJsonPath)) return [];
+
+  let data: any;
+  try {
+    data = JSON.parse(readFileSync(modelsJsonPath, "utf-8"));
+  } catch {
+    console.warn(
+      `[Azure Foundry] Warning: could not parse ${modelsJsonPath} — skipping user-defined models`,
+    );
+    return [];
+  }
+
+  const entries: any[] = data?.providers?.["azure-foundry"]?.models ?? [];
+  const result: import("@earendil-works/pi-coding-agent").ProviderModelConfig[] =
+    [];
+  const required = [
+    "id",
+    "name",
+    "api",
+    "baseUrl",
+    "deploymentId",
+    "contextWindow",
+    "maxTokens",
+  ];
+
+  for (const entry of entries) {
+    const missing = required.filter((f) => entry[f] == null);
+    if (missing.length > 0) {
+      console.warn(
+        `[Azure Foundry] Warning: skipping user model entry (missing: ${missing.join(", ")}):`,
+        JSON.stringify(entry),
+      );
+      continue;
+    }
+    deploymentIdMap.set(entry.id, entry.deploymentId);
+    apiRouteMap.set(entry.id, inferUserModelRoute(entry.api));
+    const modelConfig: import("@earendil-works/pi-coding-agent").ProviderModelConfig =
+      {
+        id: entry.id,
+        name: entry.name,
+        baseUrl: entry.baseUrl,
+        reasoning: entry.reasoning ?? false,
+        input: entry.input ?? ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: entry.contextWindow,
+        maxTokens: entry.maxTokens,
+        ...(entry.thinkingLevelMap == null
+          ? {}
+          : { thinkingLevelMap: entry.thinkingLevelMap }),
+        ...(entry.compat == null ? {} : { compat: entry.compat }),
+      };
+    result.push(modelConfig);
+  }
+  return result;
+}
+
+/** Infer OpenAI-compat token limit from resolved metadata or model name patterns. */
+function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails): OpenAITokenLimitParam {
+  if (resolved.openaiTokenLimit) return resolved.openaiTokenLimit;
   // GPT-5 and o-series models reject max_tokens on Azure/OpenAI chat completions
-  if (/^(gpt-5|o[1-9])([-.]|$)/i.test(modelName)) return "max_completion_tokens";
+  if (/^(gpt-5|o[1-9])([-.]|$)/i.test(modelName))
+    return "max_completion_tokens";
   return "max_tokens";
 }
 
-function resolveApiRoute(d: Deployment): ApiRoute {
+function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
   if (d.modelPublisher === "Anthropic") return { kind: "anthropic-messages" };
   const modelName = d.modelName ?? d.name;
-  return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName) };
+  return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName, resolved) };
 }
 
 function describeApiRoute(route: ApiRoute): string {
@@ -165,26 +339,42 @@ interface ProviderAuth {
 }
 const providerAuthMap = new Map<string, ProviderAuth>();
 
-function deploymentToModel(d: Deployment) {
+function deploymentToModel(
+  d: Deployment,
+  catalog: Map<string, Model<Api>>,
+  overrides: Record<string, ModelConfigOverride> | undefined,
+) {
   const modelName = d.modelName ?? d.name;
-  const defaults = MODEL_DEFAULTS[modelName] ?? FALLBACK;
-  apiRouteMap.set(d.name, resolveApiRoute(d));
-  return {
+  const details = resolveModelDetails(modelName, catalog, overrides);
+  apiRouteMap.set(d.name, resolveApiRoute(d, details));
+
+  const model = {
     id: d.name,
-    name: d.modelName ?? d.name,
-    reasoning: defaults.reasoning,
-    input: defaults.input,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: defaults.contextWindow,
-    maxTokens: defaults.maxTokens,
+    name: modelName,
+    reasoning: details.reasoning,
+    input: details.input,
+    cost: details.cost,
+    contextWindow: details.contextWindow,
+    maxTokens: details.maxTokens,
+    thinkingLevelMap: details.thinkingLevelMap,
   };
+
+  if (details.source === "fallback") {
+    console.log(`[Azure Foundry] ${d.name}: no metadata for "${modelName}" — using fallback defaults`);
+  } else if (details.source === "config") {
+    console.log(`[Azure Foundry] ${d.name}: using config override for "${modelName}"`);
+  }
+
+  return model;
 }
 
 // =============================================================================
 // SSE Stream Parser
 // =============================================================================
 
-async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<string> {
+async function* parseSSE(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
@@ -208,7 +398,10 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
-function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[]): unknown[] {
+function toOpenAIMessages(
+  systemPrompt: string | undefined,
+  messages: Message[],
+): unknown[] {
   const out: unknown[] = [];
   if (systemPrompt) out.push({ role: "system", content: systemPrompt });
 
@@ -218,31 +411,65 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
       if (typeof msg.content === "string") {
         out.push({ role: "user", content: msg.content });
       } else {
-        out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text"  ? { type: "text", text: (c as TextContent).text } :
-          c.type === "image" ? { type: "image_url", image_url: { url: `data:${(c as ImageContent).mimeType};base64,${(c as ImageContent).data}` } } :
-          { type: "text", text: "" }
-        )});
+        out.push({
+          role: "user",
+          content: msg.content.map((c) =>
+            c.type === "text"
+              ? { type: "text", text: (c as TextContent).text }
+              : c.type === "image"
+                ? {
+                    type: "image_url",
+                    image_url: {
+                      url: `data:${(c as ImageContent).mimeType};base64,${(c as ImageContent).data}`,
+                    },
+                  }
+                : { type: "text", text: "" },
+          ),
+        });
       }
     } else if (msg.role === "assistant") {
       const entry: Record<string, unknown> = { role: "assistant" };
-      const text = msg.content.filter((b) => b.type === "text").map((b) => (b as TextContent).text).join("\n");
-      const tcs = msg.content.filter((b) => b.type === "toolCall").map((b) => ({
-        id: (b as any).id, type: "function", function: { name: (b as any).name, arguments: JSON.stringify((b as any).arguments) },
-      }));
+      const text = msg.content
+        .filter((b) => b.type === "text")
+        .map((b) => (b as TextContent).text)
+        .join("\n");
+      const tcs = msg.content
+        .filter((b) => b.type === "toolCall")
+        .map((b) => ({
+          id: (b as any).id,
+          type: "function",
+          function: {
+            name: (b as any).name,
+            arguments: JSON.stringify((b as any).arguments),
+          },
+        }));
       if (text) entry.content = text;
       if (tcs.length) entry.tool_calls = tcs;
       out.push(entry);
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
-      out.push({ role: "tool", tool_call_id: m.toolCallId, content: m.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("\n") });
+      out.push({
+        role: "tool",
+        tool_call_id: m.toolCallId,
+        content: m.content
+          .filter((c): c is TextContent => c.type === "text")
+          .map((c) => c.text)
+          .join("\n"),
+      });
     }
   }
   return out;
 }
 
 function toOpenAITools(tools: Tool[]): unknown[] {
-  return tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
+  return tools.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters,
+    },
+  }));
 }
 
 // =============================================================================
@@ -257,25 +484,62 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
       if (typeof msg.content === "string") {
         out.push({ role: "user", content: msg.content });
       } else {
-        out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text" ? { type: "text", text: (c as TextContent).text } :
-          c.type === "image" ? { type: "image", source: { type: "base64", media_type: (c as ImageContent).mimeType, data: (c as ImageContent).data } } :
-          { type: "text", text: "" }
-        )});
+        out.push({
+          role: "user",
+          content: msg.content.map((c) =>
+            c.type === "text"
+              ? { type: "text", text: (c as TextContent).text }
+              : c.type === "image"
+                ? {
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: (c as ImageContent).mimeType,
+                      data: (c as ImageContent).data,
+                    },
+                  }
+                : { type: "text", text: "" },
+          ),
+        });
       }
     } else if (msg.role === "assistant") {
       const blocks: unknown[] = [];
       for (const b of msg.content) {
-        if (b.type === "text" && (b as TextContent).text.trim()) blocks.push({ type: "text", text: (b as TextContent).text });
-        if (b.type === "thinking") blocks.push({ type: "thinking", thinking: (b as ThinkingContent).thinking, signature: (b as ThinkingContent).thinkingSignature ?? "" });
-        if (b.type === "toolCall") blocks.push({ type: "tool_use", id: (b as any).id, name: (b as any).name, input: (b as any).arguments });
+        if (b.type === "text" && (b as TextContent).text.trim())
+          blocks.push({ type: "text", text: (b as TextContent).text });
+        if (b.type === "thinking")
+          blocks.push({
+            type: "thinking",
+            thinking: (b as ThinkingContent).thinking,
+            signature: (b as ThinkingContent).thinkingSignature ?? "",
+          });
+        if (b.type === "toolCall")
+          blocks.push({
+            type: "tool_use",
+            id: (b as any).id,
+            name: (b as any).name,
+            input: (b as any).arguments,
+          });
       }
       if (blocks.length) out.push({ role: "assistant", content: blocks });
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
-      const text = m.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("\n");
+      const text = m.content
+        .filter((c): c is TextContent => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
       // Anthropic tool results go inside a user message
-      out.push({ role: "user", content: [{ type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError }] });
+      out.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: m.toolCallId,
+            content: text,
+            is_error: m.isError,
+          },
+        ],
+      });
     }
   }
   return out;
@@ -283,8 +547,13 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
 
 function toAnthropicTools(tools: Tool[]): unknown[] {
   return tools.map((t) => ({
-    name: t.name, description: t.description,
-    input_schema: { type: "object", properties: (t.parameters as any).properties ?? {}, required: (t.parameters as any).required ?? [] },
+    name: t.name,
+    description: t.description,
+    input_schema: {
+      type: "object",
+      properties: (t.parameters as any).properties ?? {},
+      required: (t.parameters as any).required ?? [],
+    },
   }));
 }
 
@@ -293,12 +562,17 @@ function toAnthropicTools(tools: Tool[]): unknown[] {
 // =============================================================================
 
 function streamOpenAI(
-  model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined,
-  output: AssistantMessage, stream: ReturnType<typeof createAssistantMessageEventStream>,
-  baseHost: string, auth: ProviderAuth, route: Extract<ApiRoute, { kind: "openai-chat-completions" }>,
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  output: AssistantMessage,
+  stream: ReturnType<typeof createAssistantMessageEventStream>,
+  baseHost: string,
+  auth: ProviderAuth,
+  route: Extract<ApiRoute, { kind: "openai-chat-completions" }>,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
+    const url = `${baseHost}/openai/deployments/${resolveDeploymentId(model)}/chat/completions?api-version=2024-10-21`;
     const maxOutput = options?.maxTokens ?? model.maxTokens;
     const body: Record<string, unknown> = {
       messages: toOpenAIMessages(context.systemPrompt, context.messages),
@@ -314,7 +588,7 @@ function streamOpenAI(
     const authHeaders: Record<string, string> =
       auth.type === "api-key"
         ? { "api-key": token }
-        : { "Authorization": `Bearer ${token}` };
+        : { Authorization: `Bearer ${token}` };
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders },
@@ -335,7 +609,11 @@ function streamOpenAI(
 
     for await (const data of parseSSE(reader)) {
       let chunk: any;
-      try { chunk = JSON.parse(data); } catch { continue; }
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
 
       if (chunk.usage) {
         output.usage.input = chunk.usage.prompt_tokens ?? 0;
@@ -350,35 +628,97 @@ function streamOpenAI(
 
       if (typeof delta.content === "string") {
         let idx = output.content.findIndex((b) => b.type === "text");
-        if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
-        const block = output.content[idx]; if (block.type === "text") { block.text += delta.content; stream.push({ type: "text_delta", contentIndex: idx, delta: delta.content, partial: output }); }
+        if (idx === -1) {
+          output.content.push({ type: "text", text: "" });
+          idx = output.content.length - 1;
+          stream.push({
+            type: "text_start",
+            contentIndex: idx,
+            partial: output,
+          });
+        }
+        const block = output.content[idx];
+        if (block.type === "text") {
+          block.text += delta.content;
+          stream.push({
+            type: "text_delta",
+            contentIndex: idx,
+            delta: delta.content,
+            partial: output,
+          });
+        }
       }
 
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls) {
           const tci = tc.index ?? 0;
           if (tc.id) {
-            output.content.push({ type: "toolCall", id: tc.id, name: tc.function?.name ?? "", arguments: {} });
-            const ci = output.content.length - 1; tcContentIdx.set(tci, ci); tcJsonBufs.set(tci, "");
-            stream.push({ type: "toolcall_start", contentIndex: ci, partial: output });
+            output.content.push({
+              type: "toolCall",
+              id: tc.id,
+              name: tc.function?.name ?? "",
+              arguments: {},
+            });
+            const ci = output.content.length - 1;
+            tcContentIdx.set(tci, ci);
+            tcJsonBufs.set(tci, "");
+            stream.push({
+              type: "toolcall_start",
+              contentIndex: ci,
+              partial: output,
+            });
           }
           if (tc.function?.arguments) {
-            const ci = tcContentIdx.get(tci); if (ci === undefined) continue;
-            const buf = (tcJsonBufs.get(tci) ?? "") + tc.function.arguments; tcJsonBufs.set(tci, buf);
-            const block = output.content[ci]; if (block.type === "toolCall") { try { block.arguments = JSON.parse(buf); } catch {} }
-            stream.push({ type: "toolcall_delta", contentIndex: ci, delta: tc.function.arguments, partial: output });
+            const ci = tcContentIdx.get(tci);
+            if (ci === undefined) continue;
+            const buf = (tcJsonBufs.get(tci) ?? "") + tc.function.arguments;
+            tcJsonBufs.set(tci, buf);
+            const block = output.content[ci];
+            if (block.type === "toolCall") {
+              try {
+                block.arguments = JSON.parse(buf);
+              } catch {}
+            }
+            stream.push({
+              type: "toolcall_delta",
+              contentIndex: ci,
+              delta: tc.function.arguments,
+              partial: output,
+            });
           }
         }
       }
 
       if (choice.finish_reason === "stop") output.stopReason = "stop";
       else if (choice.finish_reason === "length") output.stopReason = "length";
-      else if (choice.finish_reason === "tool_calls") output.stopReason = "toolUse";
+      else if (choice.finish_reason === "tool_calls")
+        output.stopReason = "toolUse";
     }
 
     // Finalize blocks
-    for (let i = 0; i < output.content.length; i++) { if (output.content[i].type === "text") stream.push({ type: "text_end", contentIndex: i, content: (output.content[i] as TextContent).text, partial: output }); }
-    for (const [tci, ci] of tcContentIdx) { const b = output.content[ci]; if (b.type === "toolCall") { try { b.arguments = JSON.parse(tcJsonBufs.get(tci) ?? "{}"); } catch {} stream.push({ type: "toolcall_end", contentIndex: ci, toolCall: b, partial: output }); } }
+    for (let i = 0; i < output.content.length; i++) {
+      if (output.content[i].type === "text")
+        stream.push({
+          type: "text_end",
+          contentIndex: i,
+          content: (output.content[i] as TextContent).text,
+          partial: output,
+        });
+    }
+    for (const [tci, ci] of tcContentIdx) {
+      const b = output.content[ci];
+      if (b.type === "toolCall") {
+        try {
+          b.arguments = JSON.parse(tcJsonBufs.get(tci) ?? "{}");
+        } catch {}
+        stream.push({
+          type: "toolcall_end",
+          contentIndex: ci,
+          toolCall: b,
+          partial: output,
+        });
+      }
+    }
   })();
 }
 
@@ -387,14 +727,18 @@ function streamOpenAI(
 // =============================================================================
 
 function streamAnthropic(
-  model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined,
-  output: AssistantMessage, stream: ReturnType<typeof createAssistantMessageEventStream>,
-  baseHost: string, auth: ProviderAuth,
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  output: AssistantMessage,
+  stream: ReturnType<typeof createAssistantMessageEventStream>,
+  baseHost: string,
+  auth: ProviderAuth,
 ): Promise<void> {
   return (async () => {
     const url = `${baseHost}/anthropic/v1/messages`;
     const body: Record<string, unknown> = {
-      model: model.id,
+      model: resolveDeploymentId(model),
       messages: toAnthropicMessages(context.messages),
       max_tokens: options?.maxTokens ?? model.maxTokens,
       stream: true,
@@ -409,7 +753,7 @@ function streamAnthropic(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`,
+        Authorization: `Bearer ${token}`,
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(body),
@@ -430,12 +774,18 @@ function streamAnthropic(
 
     for await (const data of parseSSE(reader)) {
       let event: any;
-      try { event = JSON.parse(data); } catch { continue; }
+      try {
+        event = JSON.parse(data);
+      } catch {
+        continue;
+      }
 
       if (event.type === "message_start" && event.message?.usage) {
         output.usage.input = event.message.usage.input_tokens ?? 0;
-        output.usage.cacheRead = event.message.usage.cache_read_input_tokens ?? 0;
-        output.usage.cacheWrite = event.message.usage.cache_creation_input_tokens ?? 0;
+        output.usage.cacheRead =
+          event.message.usage.cache_read_input_tokens ?? 0;
+        output.usage.cacheWrite =
+          event.message.usage.cache_creation_input_tokens ?? 0;
       }
 
       if (event.type === "content_block_start") {
@@ -445,17 +795,38 @@ function streamAnthropic(
           output.content.push({ type: "text", text: "" });
           const ci = output.content.length - 1;
           blockIndices.set(anthropicIdx, ci);
-          stream.push({ type: "text_start", contentIndex: ci, partial: output });
+          stream.push({
+            type: "text_start",
+            contentIndex: ci,
+            partial: output,
+          });
         } else if (cb.type === "thinking") {
-          output.content.push({ type: "thinking", thinking: "", thinkingSignature: "" } as ThinkingContent);
+          output.content.push({
+            type: "thinking",
+            thinking: "",
+            thinkingSignature: "",
+          } as ThinkingContent);
           blockIndices.set(anthropicIdx, output.content.length - 1);
-          stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+          stream.push({
+            type: "thinking_start",
+            contentIndex: output.content.length - 1,
+            partial: output,
+          });
         } else if (cb.type === "tool_use") {
-          output.content.push({ type: "toolCall", id: cb.id, name: cb.name, arguments: {} });
+          output.content.push({
+            type: "toolCall",
+            id: cb.id,
+            name: cb.name,
+            arguments: {},
+          });
           const ci = output.content.length - 1;
           blockIndices.set(anthropicIdx, ci);
           tcJsonBufs.set(anthropicIdx, "");
-          stream.push({ type: "toolcall_start", contentIndex: ci, partial: output });
+          stream.push({
+            type: "toolcall_start",
+            contentIndex: ci,
+            partial: output,
+          });
         }
       }
 
@@ -467,17 +838,35 @@ function streamAnthropic(
 
         if (d.type === "text_delta" && block.type === "text") {
           block.text += d.text;
-          stream.push({ type: "text_delta", contentIndex: ci, delta: d.text, partial: output });
+          stream.push({
+            type: "text_delta",
+            contentIndex: ci,
+            delta: d.text,
+            partial: output,
+          });
         } else if (d.type === "thinking_delta" && block.type === "thinking") {
           (block as ThinkingContent).thinking += d.thinking;
-          stream.push({ type: "thinking_delta", contentIndex: ci, delta: d.thinking, partial: output });
+          stream.push({
+            type: "thinking_delta",
+            contentIndex: ci,
+            delta: d.thinking,
+            partial: output,
+          });
         } else if (d.type === "signature_delta" && block.type === "thinking") {
-          (block as ThinkingContent).thinkingSignature = ((block as ThinkingContent).thinkingSignature ?? "") + d.signature;
+          (block as ThinkingContent).thinkingSignature =
+            ((block as ThinkingContent).thinkingSignature ?? "") + d.signature;
         } else if (d.type === "input_json_delta" && block.type === "toolCall") {
           const buf = (tcJsonBufs.get(event.index) ?? "") + d.partial_json;
           tcJsonBufs.set(event.index, buf);
-          try { block.arguments = JSON.parse(buf); } catch {}
-          stream.push({ type: "toolcall_delta", contentIndex: ci, delta: d.partial_json, partial: output });
+          try {
+            block.arguments = JSON.parse(buf);
+          } catch {}
+          stream.push({
+            type: "toolcall_delta",
+            contentIndex: ci,
+            delta: d.partial_json,
+            partial: output,
+          });
         }
       }
 
@@ -485,22 +874,46 @@ function streamAnthropic(
         const ci = blockIndices.get(event.index);
         if (ci === undefined) continue;
         const block = output.content[ci];
-        if (block.type === "text") stream.push({ type: "text_end", contentIndex: ci, content: block.text, partial: output });
-        else if (block.type === "thinking") stream.push({ type: "thinking_end", contentIndex: ci, content: (block as ThinkingContent).thinking, partial: output });
+        if (block.type === "text")
+          stream.push({
+            type: "text_end",
+            contentIndex: ci,
+            content: block.text,
+            partial: output,
+          });
+        else if (block.type === "thinking")
+          stream.push({
+            type: "thinking_end",
+            contentIndex: ci,
+            content: (block as ThinkingContent).thinking,
+            partial: output,
+          });
         else if (block.type === "toolCall") {
-          try { block.arguments = JSON.parse(tcJsonBufs.get(event.index) ?? "{}"); } catch {}
-          stream.push({ type: "toolcall_end", contentIndex: ci, toolCall: block, partial: output });
+          try {
+            block.arguments = JSON.parse(tcJsonBufs.get(event.index) ?? "{}");
+          } catch {}
+          stream.push({
+            type: "toolcall_end",
+            contentIndex: ci,
+            toolCall: block,
+            partial: output,
+          });
         }
       }
 
       if (event.type === "message_delta") {
         if (event.usage) {
           output.usage.output = event.usage.output_tokens ?? 0;
-          output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+          output.usage.totalTokens =
+            output.usage.input +
+            output.usage.output +
+            output.usage.cacheRead +
+            output.usage.cacheWrite;
           calculateCost(model, output.usage);
         }
         const sr = event.delta?.stop_reason;
-        if (sr === "end_turn" || sr === "stop_sequence") output.stopReason = "stop";
+        if (sr === "end_turn" || sr === "stop_sequence")
+          output.stopReason = "stop";
         else if (sr === "max_tokens") output.stopReason = "length";
         else if (sr === "tool_use") output.stopReason = "toolUse";
       }
@@ -526,29 +939,63 @@ function streamAzureFoundry(
       api: model.api,
       provider: model.provider,
       model: model.id,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
       stopReason: "stop",
       timestamp: Date.now(),
     };
 
     try {
       const baseHost = new URL(model.baseUrl).origin;
-      const route = apiRouteMap.get(model.id) ?? { kind: "openai-chat-completions", tokenLimit: "max_tokens" };
+      const route = apiRouteMap.get(model.id) ?? {
+        kind: "openai-chat-completions",
+        tokenLimit: "max_tokens",
+      };
       // Resolve auth: use registered provider auth, fall back to api-key from options.
-      const auth: ProviderAuth = providerAuthMap.get(model.provider)
-        ?? { type: "api-key", getToken: () => Promise.resolve(options?.apiKey ?? "") };
+      const auth: ProviderAuth = providerAuthMap.get(model.provider) ?? {
+        type: "api-key",
+        getToken: () => Promise.resolve(options?.apiKey ?? ""),
+      };
 
       if (route.kind === "anthropic-messages") {
-        await streamAnthropic(model, context, options, output, stream, baseHost, auth);
+        await streamAnthropic(
+          model,
+          context,
+          options,
+          output,
+          stream,
+          baseHost,
+          auth,
+        );
       } else {
-        await streamOpenAI(model, context, options, output, stream, baseHost, auth, route);
+        await streamOpenAI(
+          model,
+          context,
+          options,
+          output,
+          stream,
+          baseHost,
+          auth,
+          route,
+        );
       }
 
-      stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+      stream.push({
+        type: "done",
+        reason: output.stopReason as "stop" | "length" | "toolUse",
+        message: output,
+      });
       stream.end();
     } catch (error) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-      output.errorMessage = error instanceof Error ? error.message : String(error);
+      output.errorMessage =
+        error instanceof Error ? error.message : String(error);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     }
@@ -573,27 +1020,36 @@ export default async function (pi: ExtensionAPI) {
   console.log(`[Azure Foundry] Auth: ${config.auth.type}`);
 
   const token = await getToken();
-  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!response.ok) { const b = await response.text().catch(() => ""); throw new Error(`Azure Foundry API ${response.status}: ${b.slice(0, 200)}`); }
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    const b = await response.text().catch(() => "");
+    throw new Error(`Azure Foundry API ${response.status}: ${b.slice(0, 200)}`);
+  }
 
   const data = (await response.json()) as { value?: Deployment[] };
-  const deployments = (data.value ?? []).filter((d) => d.capabilities?.chat_completion === "true");
-  if (deployments.length === 0) throw new Error("No chat-capable deployments found");
+  const deployments = (data.value ?? []).filter(
+    (d) => d.capabilities?.chat_completion === "true",
+  );
+  const catalog = buildKnownModelCatalog();
+  const models = deployments.map((d) => deploymentToModel(d, catalog, config.models));
+  const userModels = loadUserModels();
+  const allModels = [...models, ...userModels];
 
-  const models = deployments.map(deploymentToModel);
+  if (deployments.length === 0 && userModels.length === 0)
+    throw new Error("No chat-capable deployments found");
 
-  const summary = deployments.map((d) => {
-    const route = apiRouteMap.get(d.name)!;
-    return `${d.name} (${d.modelPublisher}, ${describeApiRoute(route)})`;
-  }).join(", ");
-  console.log(`[Azure Foundry] Found ${deployments.length} deployment(s): ${summary}`);
+  const summary = deployments
+    .map((d) => {
+      const route = apiRouteMap.get(d.name)!;
+      return `${d.name} (${d.modelPublisher}, ${describeApiRoute(route)})`;
+    })
+    .join(", ");
+  console.log(
+    `[Azure Foundry] Found ${deployments.length} deployment(s): ${summary}`,
+  );
 
-  for (const d of deployments) {
-    const modelName = d.modelName ?? d.name;
-    if (MODEL_DEFAULTS[modelName]) continue;
-    const route = apiRouteMap.get(d.name)!;
-    console.log(`[Azure Foundry] ${d.name}: no explicit defaults for "${modelName}" — using ${describeApiRoute(route)}`);
-  }
 
   const providerId = "azure-foundry";
   // Store the auth context so streamAzureFoundry can build the right headers per-request.
@@ -605,11 +1061,16 @@ export default async function (pi: ExtensionAPI) {
     // For api-key auth, store the real key. For azure-identity, pass a sentinel
     // so pi's required-field validation passes — tokens are always fetched at
     // request time via providerAuthMap and this value is never used.
-    apiKey: config.auth.type === "api-key" ? config.auth.apiKey : "azure-identity",
+    apiKey:
+      config.auth.type === "api-key" ? config.auth.apiKey : "azure-identity",
     api: "azure-foundry" as Api,
     streamSimple: streamAzureFoundry,
-    models,
+    models: allModels,
   });
 
-  console.log(`[Azure Foundry] ✓ Registered ${deployments.length} model(s)`);
+  const logSuffix =
+    userModels.length > 0
+      ? `${models.length} deployment(s) + ${userModels.length} user-defined model(s)`
+      : `${models.length} model(s)`;
+  console.log(`[Azure Foundry] ✓ Registered ${logSuffix}`);
 }
